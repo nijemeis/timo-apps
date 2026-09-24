@@ -1,0 +1,568 @@
+import CoreBluetooth
+import CoreLocation
+import UIKit
+import UserNotifications
+
+/**
+ Timo's presence engine for iOS.
+
+ iBeacons reach an iOS app only through CoreLocation. Timo monitors ONE region — the Timo UUID plus the
+ company's major — which survives termination: iOS relaunches the app in the background on enter/exit.
+ Monitoring doesn't report the minor, so on enter (and whenever the screen lights up inside the region) the
+ engine ranges for a short burst to learn which beacon — and so which location — it is.
+
+ Rules (mirroring the backend's engine.ts):
+  - first known beacon while out → check in (enter event, notification)
+  - a beacon at another location while in → check in there (the server closes the previous one)
+  - a beacon at the same location → just "still seen"; zone beacons never split a registration
+  - region exit → exit event at the last-seen time, check-out notification scheduled after the grace
+    period; if a beacon at the same location returns within the grace period the notification is
+    cancelled and an enter is queued, which the server merges back into the same registration.
+
+ Everything — config, state, queue — is persisted, so a background relaunch works without JavaScript.
+ Events are uploaded natively to POST /api/events (idempotent on deviceId + seq).
+ */
+final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDelegate {
+  static let shared = TimoEngine()
+
+  // MARK: Persisted model
+
+  struct Beacon: Codable { let minor: Int; let locationId: String?; let location: String; let spot: String }
+  struct Strings: Codable {
+    var inTitle: String; var inBody: String; var outTitle: String; var outBody: String
+    var hoursUnit: String; var minutesUnit: String
+  }
+  struct Config: Codable {
+    var uuid: String; var major: Int; var beacons: [Beacon]; var graceSeconds: Double
+    var apiUrl: String; var token: String; var deviceId: String
+    var sounds: Bool; var notifications: Bool; var strings: Strings
+  }
+  struct Inside: Codable { var minor: Int; var locationId: String?; var location: String; var spot: String; var since: Date; var lastSeen: Date }
+  struct PendingExit: Codable { var inside: Inside; var at: Date; var deadline: Date }
+  struct State: Codable {
+    var monitoring = false
+    var inside: Inside?
+    var pendingExit: PendingExit?
+    var nextSeq = 0
+    var lastSyncAt: Date?
+    var lastSyncError: String?
+  }
+  struct QueuedEvent: Codable { let seq: Int; let type: String; let uuid: String; let major: Int; let minor: Int; let at: Date; let rssi: Int? }
+
+  private let defaults = UserDefaults.standard
+  private let configKey = "timo.engine.config"
+  private let stateKey = "timo.engine.state"
+  private let queueKey = "timo.engine.queue"
+
+  private(set) var config: Config?
+  private(set) var state = State()
+  private var queue: [QueuedEvent] = []
+
+  // MARK: Runtime
+
+  private let lm = CLLocationManager()
+  private var central: CBCentralManager?
+  private var booted = false
+  private var burstUntil: Date?
+  private var foregroundRanging = false
+  private var rangingActive = false
+  private var bgTask: UIBackgroundTaskIdentifier = .invalid
+  private var exitTimer: Timer?
+  private var uploading = false
+  private var permissionWaiters: [(String) -> Void] = []
+  private var bluetoothWaiters: [() -> Void] = []
+
+  /// Set by the Expo module: (eventName, payload).
+  var emit: ((String, [String: Any]) -> Void)?
+
+  private static let checkoutNotificationId = "timo.checkout"
+  private static let seqEpoch = Date(timeIntervalSince1970: 1_704_067_200) // 2024-01-01
+
+  override private init() {
+    super.init()
+  }
+
+  /// Called at app launch (TimoAppDelegateSubscriber) and by the module; idempotent.
+  func boot() {
+    if booted { return }
+    booted = true
+    load()
+    lm.delegate = self
+    lm.pausesLocationUpdatesAutomatically = false
+    NotificationCenter.default.addObserver(self, selector: #selector(appActive), name: UIApplication.didBecomeActiveNotification, object: nil)
+    // A relaunch may land after a check-out deadline passed while suspended.
+    settlePendingExit(now: Date())
+    if state.monitoring, config != nil { startMonitoring() }
+    if !queue.isEmpty { upload() }
+  }
+
+  // MARK: Persistence
+
+  private func load() {
+    let dec = JSONDecoder()
+    if let d = defaults.data(forKey: configKey) { config = try? dec.decode(Config.self, from: d) }
+    if let d = defaults.data(forKey: stateKey), let s = try? dec.decode(State.self, from: d) { state = s }
+    if let d = defaults.data(forKey: queueKey), let q = try? dec.decode([QueuedEvent].self, from: d) { queue = q }
+  }
+
+  private func save() {
+    let enc = JSONEncoder()
+    if let c = config, let d = try? enc.encode(c) { defaults.set(d, forKey: configKey) } else { defaults.removeObject(forKey: configKey) }
+    if let d = try? enc.encode(state) { defaults.set(d, forKey: stateKey) }
+    if let d = try? enc.encode(queue) { defaults.set(d, forKey: queueKey) }
+    emit?("onState", stateDict())
+  }
+
+  // MARK: Public API (module)
+
+  func configure(_ c: Config) {
+    let majorChanged = config?.major != c.major || config?.uuid.uppercased() != c.uuid.uppercased()
+    config = c
+    // A beacon that was un-placed while we were inside it: forget the stale state.
+    if let inside = state.inside, !c.beacons.contains(where: { $0.minor == inside.minor }) { state.inside = nil }
+    save()
+    if majorChanged && state.monitoring { startMonitoring() }
+  }
+
+  func setPreferences(sounds: Bool?, notifications: Bool?, strings: Strings?) {
+    guard var c = config else { return }
+    if let s = sounds { c.sounds = s }
+    if let n = notifications { c.notifications = n }
+    if let s = strings { c.strings = s }
+    config = c
+    save()
+  }
+
+  func start() {
+    state.monitoring = true
+    save()
+    startMonitoring()
+  }
+
+  func stop() {
+    state.monitoring = false
+    save()
+    for r in lm.monitoredRegions { lm.stopMonitoring(for: r) }
+    stopRanging(force: true)
+  }
+
+  func reset() {
+    stop()
+    UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.checkoutNotificationId])
+    let seq = state.nextSeq
+    config = nil
+    state = State()
+    state.nextSeq = seq
+    queue = []
+    save()
+  }
+
+  func setForegroundRanging(_ on: Bool) {
+    foregroundRanging = on
+    if on { startRanging() } else { stopRanging(force: false) }
+  }
+
+  func simulate(type: String, minor: Int) {
+    guard let c = config, let b = c.beacons.first(where: { $0.minor == minor }) else { return }
+    if type == "enter" { seen(b, rssi: -60, at: Date()) } else { regionExited(now: Date(), simulated: true) }
+  }
+
+  func flush(_ done: @escaping () -> Void) {
+    settlePendingExit(now: Date())
+    upload(done)
+  }
+
+  var isAvailable: Bool {
+    CLLocationManager.isMonitoringAvailable(for: CLBeaconRegion.self) && CLLocationManager.isRangingAvailable()
+  }
+
+  func stateDict() -> [String: Any] {
+    func insideDict(_ i: Inside) -> [String: Any] {
+      ["minor": i.minor, "locationId": i.locationId as Any, "location": i.location, "spot": i.spot, "since": ms(i.since), "lastSeen": ms(i.lastSeen)]
+    }
+    return [
+      "configured": config != nil,
+      "monitoring": state.monitoring,
+      "inside": state.inside.map(insideDict) as Any,
+      "pendingExit": state.pendingExit.map { ["minor": $0.inside.minor, "at": ms($0.at), "deadline": ms($0.deadline)] } as Any,
+      "queued": queue.count,
+      "lastSyncAt": state.lastSyncAt.map(ms) as Any,
+      "lastSyncError": state.lastSyncError as Any,
+    ]
+  }
+
+  // MARK: Monitoring & ranging
+
+  private func region(_ c: Config) -> CLBeaconRegion? {
+    guard let uuid = UUID(uuidString: c.uuid) else { return nil }
+    let r = CLBeaconRegion(uuid: uuid, major: CLBeaconMajorValue(c.major), identifier: "timo.\(c.major)")
+    r.notifyOnEntry = true
+    r.notifyOnExit = true
+    // Screen-on while inside delivers didDetermineState → another chance to resolve the minor.
+    r.notifyEntryStateOnDisplay = true
+    return r
+  }
+
+  private func startMonitoring() {
+    guard let c = config, let r = region(c) else { return }
+    for existing in lm.monitoredRegions where existing.identifier != r.identifier { lm.stopMonitoring(for: existing) }
+    guard CLLocationManager.isMonitoringAvailable(for: CLBeaconRegion.self) else { return }
+    lm.startMonitoring(for: r)
+    lm.requestState(for: r)
+  }
+
+  private func startRanging() {
+    guard let c = config, let uuid = UUID(uuidString: c.uuid), CLLocationManager.isRangingAvailable() else { return }
+    if rangingActive { return }
+    rangingActive = true
+    lm.startRangingBeacons(satisfying: CLBeaconIdentityConstraint(uuid: uuid, major: CLBeaconMajorValue(c.major)))
+  }
+
+  private func stopRanging(force: Bool) {
+    guard rangingActive, let c = config, let uuid = UUID(uuidString: c.uuid) else { rangingActive = false; return }
+    if !force && (foregroundRanging || (burstUntil.map { $0 > Date() } ?? false)) { return }
+    lm.stopRangingBeacons(satisfying: CLBeaconIdentityConstraint(uuid: uuid, major: CLBeaconMajorValue(c.major)))
+    rangingActive = false
+  }
+
+  /// Range for a few seconds under a background task — enough to learn the minor after a wake-up.
+  private func burst(seconds: TimeInterval = 12) {
+    beginBackgroundTask()
+    burstUntil = Date().addingTimeInterval(seconds)
+    startRanging()
+    DispatchQueue.main.asyncAfter(deadline: .now() + seconds + 0.5) { [weak self] in
+      guard let self else { return }
+      self.burstUntil = nil
+      self.stopRanging(force: false)
+      self.upload { self.endBackgroundTask() }
+    }
+  }
+
+  private func beginBackgroundTask() {
+    guard bgTask == .invalid else { return }
+    bgTask = UIApplication.shared.beginBackgroundTask(withName: "timo.presence") { [weak self] in self?.endBackgroundTask() }
+  }
+
+  private func endBackgroundTask() {
+    guard bgTask != .invalid else { return }
+    UIApplication.shared.endBackgroundTask(bgTask)
+    bgTask = .invalid
+  }
+
+  // MARK: Engine
+
+  private func beacon(minor: Int) -> Beacon? { config?.beacons.first { $0.minor == minor } }
+
+  private func sameLocation(_ a: Inside, _ b: Beacon) -> Bool {
+    a.minor == b.minor || (a.locationId != nil && a.locationId == b.locationId)
+  }
+
+  private func seen(_ b: Beacon, rssi: Int?, at now: Date) {
+    guard let c = config else { return }
+    settlePendingExit(now: now)
+
+    if let p = state.pendingExit {
+      // Back within the grace period: it was never a real check-out.
+      if sameLocation(p.inside, b) {
+        var resumed = p.inside
+        resumed.lastSeen = now
+        state.inside = resumed
+        state.pendingExit = nil
+        cancelCheckoutNotification()
+        enqueue(type: "enter", minor: b.minor, at: now, rssi: rssi, c: c)
+        save(); upload()
+        return
+      }
+      // Another location inside the grace period: the check-out stands, notify it now.
+      state.pendingExit = nil
+      fireCheckout(p, now: now)
+    }
+
+    if var inside = state.inside {
+      if sameLocation(inside, b) {
+        inside.lastSeen = now
+        state.inside = inside
+        save()
+        return
+      }
+    }
+    // Check in (or move to another location).
+    let inside = Inside(minor: b.minor, locationId: b.locationId, location: b.location, spot: b.spot, since: now, lastSeen: now)
+    state.inside = inside
+    enqueue(type: "enter", minor: b.minor, at: now, rssi: rssi, c: c)
+    save()
+    announce(type: "in", inside: inside, at: now, since: nil)
+    upload()
+  }
+
+  private func regionExited(now: Date, simulated: Bool = false) {
+    guard let c = config, let inside = state.inside else { return }
+    // CoreLocation reports an exit ~30 s after the last advertisement; ranging may know better.
+    let lastSeen = simulated ? now : max(inside.lastSeen, now.addingTimeInterval(-30))
+    enqueue(type: "exit", minor: inside.minor, at: lastSeen, rssi: nil, c: c)
+    state.inside = nil
+    let p = PendingExit(inside: inside, at: lastSeen, deadline: lastSeen.addingTimeInterval(c.graceSeconds))
+    state.pendingExit = p
+    save()
+    scheduleCheckout(p, now: now)
+    upload()
+  }
+
+  /// If the grace period of a pending exit is over, it is final.
+  private func settlePendingExit(now: Date) {
+    guard let p = state.pendingExit, p.deadline <= now else { return }
+    state.pendingExit = nil
+    save()
+    // Background: the scheduled notification has fired (or will now). Foreground: show the sheet.
+    if UIApplication.shared.applicationState == .active { fireCheckout(p, now: now) }
+  }
+
+  private func scheduleCheckout(_ p: PendingExit, now: Date) {
+    exitTimer?.invalidate()
+    let delay = max(0.5, p.deadline.timeIntervalSince(now))
+    postNotification(type: "out", inside: p.inside, at: p.at, since: p.inside.since, after: delay, id: Self.checkoutNotificationId)
+    // While the app runs, a timer settles it at the deadline (and swaps the notification for the sheet).
+    exitTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+      self?.settlePendingExit(now: Date())
+    }
+  }
+
+  private func cancelCheckoutNotification() {
+    exitTimer?.invalidate()
+    UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.checkoutNotificationId])
+  }
+
+  private func fireCheckout(_ p: PendingExit, now: Date) {
+    exitTimer?.invalidate()
+    if UIApplication.shared.applicationState == .active {
+      UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.checkoutNotificationId])
+      emit?("onPresence", presencePayload(type: "out", inside: p.inside, at: p.at, since: p.inside.since, foreground: true))
+    } else {
+      // Deliver now in case the scheduled one was cancelled (switching location).
+      postNotification(type: "out", inside: p.inside, at: p.at, since: p.inside.since, after: nil, id: Self.checkoutNotificationId)
+      emit?("onPresence", presencePayload(type: "out", inside: p.inside, at: p.at, since: p.inside.since, foreground: false))
+    }
+  }
+
+  private func announce(type: String, inside: Inside, at: Date, since: Date?) {
+    let fg = UIApplication.shared.applicationState == .active
+    if !fg { postNotification(type: type, inside: inside, at: at, since: since, after: nil, id: "timo.\(type).\(Int(at.timeIntervalSince1970))") }
+    emit?("onPresence", presencePayload(type: type, inside: inside, at: at, since: since, foreground: fg))
+  }
+
+  private func presencePayload(type: String, inside: Inside, at: Date, since: Date?, foreground: Bool) -> [String: Any] {
+    ["type": type, "minor": inside.minor, "location": inside.location, "spot": inside.spot, "at": ms(at), "since": since.map(ms) as Any, "foreground": foreground]
+  }
+
+  private func enqueue(type: String, minor: Int, at: Date, rssi: Int?, c: Config) {
+    // Seq must only grow, even across sign-out/reinstall of the queue: floor it at seconds since 2024.
+    let floor = Int(Date().timeIntervalSince(Self.seqEpoch))
+    state.nextSeq = max(state.nextSeq + 1, floor)
+    queue.append(QueuedEvent(seq: state.nextSeq, type: type, uuid: c.uuid.uppercased(), major: c.major, minor: minor, at: at, rssi: rssi))
+    if queue.count > 2000 { queue.removeFirst(queue.count - 2000) }
+  }
+
+  // MARK: Notifications
+
+  private func postNotification(type: String, inside: Inside, at: Date, since: Date?, after: TimeInterval?, id: String) {
+    guard let c = config, c.notifications else { return }
+    let s = c.strings
+    let fmt = DateFormatter()
+    fmt.dateFormat = "HH:mm"
+    let duration: String = {
+      guard let since else { return "" }
+      let mins = max(0, Int((at.timeIntervalSince(since) / 60).rounded()))
+      return "\(mins / 60)\(s.hoursUnit) \(String(format: "%02d", mins % 60))\(s.minutesUnit)"
+    }()
+    func fill(_ t: String) -> String {
+      t.replacingOccurrences(of: "{location}", with: inside.location)
+        .replacingOccurrences(of: "{spot}", with: inside.spot)
+        .replacingOccurrences(of: "{time}", with: fmt.string(from: at))
+        .replacingOccurrences(of: "{duration}", with: duration)
+    }
+    let content = UNMutableNotificationContent()
+    content.title = fill(type == "in" ? s.inTitle : s.outTitle)
+    content.body = fill(type == "in" ? s.inBody : s.outBody)
+    if c.sounds { content.sound = UNNotificationSound(named: UNNotificationSoundName(type == "in" ? "timo_checkin.wav" : "timo_checkout.wav")) }
+    content.threadIdentifier = "timo.presence"
+    content.userInfo = ["timo": type]
+    let trigger = after.map { UNTimeIntervalNotificationTrigger(timeInterval: max(1, $0), repeats: false) }
+    UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: trigger))
+  }
+
+  // MARK: Upload
+
+  func upload(_ done: (() -> Void)? = nil) {
+    guard let c = config, !queue.isEmpty, !uploading, let url = URL(string: "\(c.apiUrl)/api/events") else { done?(); return }
+    uploading = true
+    let batch = Array(queue.prefix(200))
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let body: [String: Any] = [
+      "deviceId": c.deviceId,
+      "events": batch.map { e -> [String: Any] in
+        ["seq": e.seq, "type": e.type, "uuid": e.uuid, "major": e.major, "minor": e.minor, "at": iso.string(from: e.at), "rssi": e.rssi as Any]
+      },
+    ]
+    var req = URLRequest(url: url, timeoutInterval: 20)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.setValue("Bearer \(c.token)", forHTTPHeaderField: "Authorization")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    let task = UIApplication.shared.beginBackgroundTask(withName: "timo.upload")
+    URLSession.shared.dataTask(with: req) { [weak self] data, response, error in
+      DispatchQueue.main.async {
+        guard let self else { return }
+        self.uploading = false
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if let error {
+          self.state.lastSyncError = error.localizedDescription
+        } else if (200..<300).contains(status), let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+          let ack = (json["ackSeq"] as? Int) ?? batch.last?.seq ?? 0
+          let sent = Set(batch.map { $0.seq })
+          self.queue.removeAll { sent.contains($0.seq) || $0.seq <= ack }
+          self.state.lastSyncAt = Date()
+          self.state.lastSyncError = nil
+        } else {
+          self.state.lastSyncError = "HTTP \(status)"
+        }
+        self.save()
+        UIApplication.shared.endBackgroundTask(task)
+        if self.state.lastSyncError == nil && !self.queue.isEmpty { self.upload(done) } else { done?() }
+      }
+    }.resume()
+  }
+
+  // MARK: Permissions
+
+  func permissions() -> [String: Any] {
+    let loc: String
+    switch lm.authorizationStatus {
+    case .authorizedAlways: loc = "always"
+    case .authorizedWhenInUse: loc = "whenInUse"
+    case .denied, .restricted: loc = "denied"
+    default: loc = "undetermined"
+    }
+    let bt: String
+    switch CBCentralManager.authorization {
+    case .allowedAlways: bt = (central?.state == .poweredOff) ? "unavailable" : "granted"
+    case .denied, .restricted: bt = "denied"
+    default: bt = "undetermined"
+    }
+    return ["bluetooth": bt, "location": loc, "notifications": notificationStatus, "batteryUnrestricted": true]
+  }
+
+  private var notificationStatus = "undetermined"
+
+  func refreshNotificationStatus(_ done: @escaping () -> Void) {
+    UNUserNotificationCenter.current().getNotificationSettings { s in
+      DispatchQueue.main.async {
+        switch s.authorizationStatus {
+        case .authorized, .provisional, .ephemeral: self.notificationStatus = "granted"
+        case .denied: self.notificationStatus = "denied"
+        default: self.notificationStatus = "undetermined"
+        }
+        // Touch the Bluetooth manager once authorised, so a powered-off radio is reported.
+        if CBCentralManager.authorization == .allowedAlways && self.central == nil {
+          self.central = CBCentralManager(delegate: self, queue: nil, options: [CBCentralManagerOptionShowPowerAlertKey: false])
+        }
+        done()
+      }
+    }
+  }
+
+  func requestBluetooth(_ done: @escaping () -> Void) {
+    if central != nil && CBCentralManager.authorization != .notDetermined { done(); return }
+    bluetoothWaiters.append(done)
+    // Creating the manager shows the NSBluetoothAlwaysUsageDescription prompt.
+    central = CBCentralManager(delegate: self, queue: nil, options: [CBCentralManagerOptionShowPowerAlertKey: false])
+  }
+
+  func requestLocation(_ done: @escaping () -> Void) {
+    let status = lm.authorizationStatus
+    if status == .authorizedAlways || status == .denied || status == .restricted { done(); return }
+    permissionWaiters.append { _ in done() }
+    // Not determined → the first prompt; When-in-use → the one-time upgrade prompt to Always.
+    lm.requestAlwaysAuthorization()
+    // If iOS decides not to show a prompt, don't hang: resolve once the app is active again.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+      if UIApplication.shared.applicationState == .active { self?.resolveLocationWaiters() }
+    }
+  }
+
+  func requestNotifications(_ done: @escaping () -> Void) {
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in
+      self.refreshNotificationStatus(done)
+    }
+  }
+
+  private func resolveLocationWaiters() {
+    let w = permissionWaiters
+    permissionWaiters = []
+    w.forEach { $0("") }
+  }
+
+  @objc private func appActive() {
+    settlePendingExit(now: Date())
+    if !permissionWaiters.isEmpty && lm.authorizationStatus != .notDetermined { resolveLocationWaiters() }
+    if !queue.isEmpty { upload() }
+    if state.monitoring, let c = config, let r = region(c) { lm.requestState(for: r) }
+  }
+
+  // MARK: CBCentralManagerDelegate
+
+  func centralManagerDidUpdateState(_ central: CBCentralManager) {
+    let w = bluetoothWaiters
+    bluetoothWaiters = []
+    w.forEach { $0() }
+  }
+
+  // MARK: CLLocationManagerDelegate
+
+  func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+    if manager.authorizationStatus != .notDetermined { resolveLocationWaiters() }
+    if state.monitoring && (manager.authorizationStatus == .authorizedAlways || manager.authorizationStatus == .authorizedWhenInUse) { startMonitoring() }
+  }
+
+  func locationManager(_ manager: CLLocationManager, didDetermineState regionState: CLRegionState, for region: CLRegion) {
+    guard region is CLBeaconRegion else { return }
+    switch regionState {
+    case .inside: burst()
+    case .outside: if state.inside != nil { regionExited(now: Date()) }
+    default: break
+    }
+  }
+
+  func locationManager(_ manager: CLLocationManager, didEnterRegion region: CLRegion) {
+    guard region is CLBeaconRegion else { return }
+    burst()
+  }
+
+  func locationManager(_ manager: CLLocationManager, didExitRegion region: CLRegion) {
+    guard region is CLBeaconRegion else { return }
+    beginBackgroundTask()
+    regionExited(now: Date())
+  }
+
+  func locationManager(_ manager: CLLocationManager, didRange beacons: [CLBeacon], satisfying constraint: CLBeaconIdentityConstraint) {
+    guard let c = config else { return }
+    let heard = beacons.filter { $0.rssi != 0 && $0.major.intValue == c.major }
+    if foregroundRanging {
+      emit?("onRanged", ["beacons": heard.map { ["major": $0.major.intValue, "minor": $0.minor.intValue, "rssi": $0.rssi, "known": beacon(minor: $0.minor.intValue) != nil] }])
+    }
+    // Strongest known beacon decides.
+    guard let best = heard.filter({ beacon(minor: $0.minor.intValue) != nil }).max(by: { $0.rssi < $1.rssi }),
+          let b = beacon(minor: best.minor.intValue) else { return }
+    seen(b, rssi: best.rssi, at: Date())
+  }
+
+  func locationManager(_ manager: CLLocationManager, monitoringDidFailFor region: CLRegion?, withError error: Error) {
+    emit?("onError", ["message": "monitoring failed: \(error.localizedDescription)"])
+  }
+
+  func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+    emit?("onError", ["message": error.localizedDescription])
+  }
+}
+
+private func ms(_ d: Date) -> Double { (d.timeIntervalSince1970 * 1000).rounded() }

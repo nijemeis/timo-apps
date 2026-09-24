@@ -1,0 +1,8 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["TimoBeaconsModule"],
+    "appDelegateSubscribers": ["TimoAppDelegateSubscriber"]
+  },
+  "android": { "modules": ["expo.modules.timobeacons.TimoBeaconsModule"] }
+}

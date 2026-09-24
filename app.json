@@ -1,0 +1,63 @@
+{
+  "expo": {
+    "name": "Timo",
+    "slug": "timo",
+    "scheme": "timo",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "backgroundColor": "#f2f2f3",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.sensimity.timo",
+      "appleTeamId": "MY74K55V88",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Timo detects the Timo beacons at your workplace entrances to register your working time. Your GPS position is never stored.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Timo needs this to detect workplace beacons while the app is closed, so check-in and check-out happen automatically. Timo never stores your GPS position.",
+        "NSBluetoothAlwaysUsageDescription": "Timo listens for Timo beacons at your workplace entrances. Nothing is tracked anywhere else.",
+        "UIBackgroundModes": ["location"],
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "com.sensimity.timo",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundColor": "#f2f2f3"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "BLUETOOTH_SCAN",
+        "BLUETOOTH_CONNECT",
+        "POST_NOTIFICATIONS",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE"
+      ],
+      "versionCode": 1,
+      "blockedPermissions": [
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "plugins": [
+      "expo-font",
+      "expo-secure-store",
+      "expo-localization",
+      "expo-web-browser",
+      ["expo-notifications", { "color": "#5980a6", "sounds": ["./assets/timo_checkin.wav", "./assets/timo_checkout.wav"] }],
+      ["expo-splash-screen", { "backgroundColor": "#f2f2f3", "image": "./assets/splash-mark.png", "imageWidth": 160, "resizeMode": "contain" }],
+      ["expo-audio", { "microphonePermission": false, "recordAudioAndroid": false, "enableBackgroundPlayback": false, "enableBackgroundRecording": false }]
+    ],
+    "extra": {
+      "apiUrl": "http://localhost:3200"
+    }
+  }
+}

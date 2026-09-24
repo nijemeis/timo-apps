@@ -1,0 +1,22 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+  <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+  <uses-permission android:name="android.permission.INTERNET" />
+
+  <application>
+    <!-- Owns the BLE scan and the check-in/out engine while the phone is in a pocket. `location` type:
+         a beacon scan is a location signal, and that type keeps results arriving in the background. -->
+    <service
+      android:name=".TimoService"
+      android:exported="false"
+      android:foregroundServiceType="location" />
+    <!-- Restart detection after a reboot or an app update. -->
+    <receiver android:name=".TimoBootReceiver" android:exported="false">
+      <intent-filter>
+        <action android:name="android.intent.action.BOOT_COMPLETED" />
+        <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+      </intent-filter>
+    </receiver>
+  </application>
+</manifest>
