@@ -532,14 +532,14 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
 
   func locationManager(_ manager: CLLocationManager, didRange beacons: [CLBeacon], satisfying constraint: CLBeaconIdentityConstraint) {
     guard let c = config else { return }
-    let heard = beacons.filter { $0.rssi != 0 && $0.major.intValue == c.major }
+    let ranged = beacons.filter { $0.rssi != 0 && $0.major.intValue == c.major }
     if foregroundRanging {
-      emit?("onRanged", ["beacons": heard.map { ["major": $0.major.intValue, "minor": $0.minor.intValue, "rssi": $0.rssi, "known": beacon(minor: $0.minor.intValue) != nil] }])
+      emit?("onRanged", ["beacons": ranged.map { ["major": $0.major.intValue, "minor": $0.minor.intValue, "rssi": $0.rssi, "known": beacon(minor: $0.minor.intValue) != nil] }])
     }
     // Strongest known beacon decides.
-    guard let best = heard.filter({ beacon(minor: $0.minor.intValue) != nil }).max(by: { $0.rssi < $1.rssi }),
+    guard let best = ranged.filter({ beacon(minor: $0.minor.intValue) != nil }).max(by: { $0.rssi < $1.rssi }),
           let b = beacon(minor: best.minor.intValue) else { return }
-    heard(b, rssi: best.rssi, at: Date())
+    self.heard(b, rssi: best.rssi, at: Date())
   }
 
   func locationManager(_ manager: CLLocationManager, monitoringDidFailFor region: CLRegion?, withError error: Error) {
