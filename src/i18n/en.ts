@@ -199,8 +199,8 @@ const en = {
 
   // Dev simulator
   simTitle: 'Beacon simulator',
-  walkIn: 'Walk in',
-  leave: 'Leave',
+  walkIn: 'Pass',
+  leave: 'Out of range',
   simNoModule: 'The native beacon module is not linked in this build.',
   simNoBeacons: 'No beacons configured for your company yet.',
   simSync: 'Sync now',

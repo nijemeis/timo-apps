@@ -13,7 +13,7 @@ import type { BeaconConfig } from '../../api/types';
 import { useSession, type Lang } from '../session';
 
 /**
- * JS side of presence. The native engine (modules/timo-beacons) decides check-in/check-out and keeps working
+ * JS side of presence. The native pass-the-gate engine (modules/timo-beacons) decides check-in/check-out and keeps working
  * with the app closed; this service configures it from /api/me/beacon-config, mirrors its state for the UI,
  * relays foreground check-ins to the confirmation sheet and flushes the event queue while the app is open.
  */
@@ -135,7 +135,9 @@ export async function syncPresence() {
     uuid: config.uuid,
     major: config.major,
     beacons: config.beacons.map((b) => ({ minor: b.minor, locationId: b.locationId, location: b.location, spot: b.spot })),
-    graceSeconds: config.graceMinutes * 60,
+    awaySeconds: config.awayMinutes * 60,
+    lockSeconds: config.passLockMinutes * 60,
+    serverOpen: config.open ? { minor: config.open.minor, since: Date.parse(config.open.checkInAt) } : null,
     apiUrl: API_URL,
     token,
     deviceId,
@@ -166,7 +168,7 @@ export const startRanging = () => TimoBeacons?.startRanging();
 export const stopRanging = () => { usePresence.setState({ nearby: [] }); return TimoBeacons?.stopRanging(); };
 
 /** Dev/simulator only: drive the engine without BLE (the prototype's beacon simulator). */
-export async function simulate(type: 'enter' | 'exit', minor: number) {
+export async function simulate(type: 'pass' | 'away', minor: number) {
   await TimoBeacons?.simulate(type, minor);
 }
 

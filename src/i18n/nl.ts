@@ -186,8 +186,8 @@ const nl: Dict = {
   joined: (company: string) => `Je bent lid van ${company}`,
 
   simTitle: 'Beacon-simulator',
-  walkIn: 'Binnen',
-  leave: 'Weg',
+  walkIn: 'Passeer',
+  leave: 'Buiten bereik',
   simNoModule: 'De native beacon-module zit niet in deze build.',
   simNoBeacons: 'Nog geen beacons ingesteld voor je bedrijf.',
   simSync: 'Nu synchroniseren',

@@ -24,16 +24,16 @@ import java.util.TimeZone
 import java.util.concurrent.Executors
 
 /**
- * Timo's presence engine for Android — process-wide, persisted in SharedPreferences, so it runs the same
+ * Timo's pass-the-gate engine for Android — process-wide, persisted in SharedPreferences, so it runs the same
  * whether the app UI is open, in the background, or the process was restarted by [TimoBootReceiver].
  *
  * Android has no OS region monitoring, so [TimoService] scans continuously and feeds every sighting of a
  * configured (major, minor) into [seen]. The rules mirror the backend (web/src/lib/engine.ts):
- *  - first known beacon while out → check in (enter event + notification)
- *  - a beacon at another location while in → check in there (the server closes the previous one)
- *  - a beacon at the same location → "still seen"; zone beacons never split a registration
- *  - no beacon of the current location for the grace period → check out, timestamped at the last sighting
- * Unlike iOS, the grace period is applied before anything is emitted, so there is no pending exit.
+ *  - every pass of a company beacon toggles: checked out → check in, checked in → check out, timestamped at
+ *    the pass; being out of range in between means nothing (a field worker stays checked in)
+ *  - a sighting is a pass only if no company beacon was heard for the away time before it, and the pass lock
+ *    has elapsed since the previous pass — standing at the gate never flips the state back
+ *  - a check-in from an earlier day is dropped at midnight (the server closes it at 23:59 as `auto`)
  */
 object TimoCore {
   data class Beacon(val minor: Int, val locationId: String?, val location: String, val spot: String)
@@ -54,6 +54,8 @@ object TimoCore {
   var config: JSONObject? = null; private set
   var monitoring = false; private set
   var inside: Inside? = null; private set
+  private var lastPassAt: Long? = null
+  private var lastHeardAt: Long? = null
   private var nextSeq = 0L
   private var queue = JSONArray()
   private var lastSyncAt: Long? = null
@@ -76,6 +78,8 @@ object TimoCore {
     queue = p.getString("queue", null)?.let { JSONArray(it) } ?: JSONArray()
     lastSyncAt = if (p.contains("lastSyncAt")) p.getLong("lastSyncAt", 0) else null
     lastSyncError = p.getString("lastSyncError", null)
+    lastPassAt = if (p.contains("lastPassAt")) p.getLong("lastPassAt", 0) else null
+    lastHeardAt = if (p.contains("lastHeardAt")) p.getLong("lastHeardAt", 0) else null
     inside = p.getString("inside", null)?.let {
       val o = JSONObject(it)
       Inside(o.getInt("minor"), o.optString("locationId").ifEmpty { null }, o.getString("location"), o.getString("spot"), o.getLong("since"), o.getLong("lastSeen"))
@@ -95,6 +99,8 @@ object TimoCore {
       .apply {
         if (lastSyncAt != null) putLong("lastSyncAt", lastSyncAt!!) else remove("lastSyncAt")
         putString("lastSyncError", lastSyncError)
+        if (lastPassAt != null) putLong("lastPassAt", lastPassAt!!) else remove("lastPassAt")
+        if (lastHeardAt != null) putLong("lastHeardAt", lastHeardAt!!) else remove("lastHeardAt")
         putString("inside", i?.let {
           JSONObject().put("minor", it.minor).put("locationId", it.locationId ?: "").put("location", it.location)
             .put("spot", it.spot).put("since", it.since).put("lastSeen", it.lastSeen).toString()
@@ -108,7 +114,8 @@ object TimoCore {
 
   val uuid: String? get() = config?.optString("uuid")?.lowercase()
   val major: Int get() = config?.optInt("major", -1) ?: -1
-  val graceMs: Long get() = ((config?.optDouble("graceSeconds", 180.0) ?: 180.0) * 1000).toLong()
+  val awayMs: Long get() = ((config?.optDouble("awaySeconds", 180.0) ?: 180.0) * 1000).toLong()
+  val lockMs: Long get() = ((config?.optDouble("lockSeconds", 900.0) ?: 900.0) * 1000).toLong()
 
   fun beacon(minor: Int): Beacon? {
     val arr = config?.optJSONArray("beacons") ?: return null
@@ -124,7 +131,21 @@ object TimoCore {
   @Synchronized
   fun configure(c: JSONObject) {
     config = c
-    inside?.let { if (beacon(it.minor) == null) inside = null }
+    // Nothing of ours waiting for the server: take its view (fresh install, another phone, an admin fix).
+    if (queue.length() == 0) {
+      val o = c.optJSONObject("serverOpen")
+      if (o == null) {
+        inside = null
+      } else {
+        val since = o.optDouble("since").toLong()
+        if (inside?.let { Math.abs(it.since - since) > 1000 } != false) {
+          val minor = if (o.isNull("minor")) -1 else o.optInt("minor", -1)
+          val b = beacon(minor)
+          inside = Inside(minor, b?.locationId, b?.location ?: "", b?.spot ?: "", since, since)
+        }
+      }
+    }
+    rollDay(System.currentTimeMillis())
     save()
     if (monitoring) TimoService.start(app)
   }
@@ -158,6 +179,8 @@ object TimoCore {
     stop()
     config = null
     inside = null
+    lastPassAt = null
+    lastHeardAt = null
     queue = JSONArray()
     lastSyncAt = null
     lastSyncError = null
@@ -170,7 +193,8 @@ object TimoCore {
       "configured" to (config != null),
       "monitoring" to monitoring,
       "inside" to i?.let { bundleOf("minor" to it.minor, "locationId" to it.locationId, "location" to it.location, "spot" to it.spot, "since" to it.since.toDouble(), "lastSeen" to it.lastSeen.toDouble()) },
-      "pendingExit" to null,
+      "lastPassAt" to lastPassAt?.toDouble(),
+      "awaySince" to lastHeardAt?.takeIf { System.currentTimeMillis() - it > 30_000 }?.toDouble(),
       "queued" to queue.length(),
       "lastSyncAt" to lastSyncAt?.toDouble(),
       "lastSyncError" to lastSyncError,
@@ -179,48 +203,75 @@ object TimoCore {
 
   // ───────────────────────── engine ─────────────────────────
 
-  private fun sameLocation(a: Inside, b: Beacon) = a.minor == b.minor || (a.locationId != null && a.locationId == b.locationId)
+  /** A check-in from an earlier local day is over: the server closed it at 23:59 (`auto`). */
+  private fun rollDay(now: Long) {
+    val i = inside ?: return
+    val a = java.util.Calendar.getInstance().apply { timeInMillis = i.since }
+    val b = java.util.Calendar.getInstance().apply { timeInMillis = now }
+    if (a.get(java.util.Calendar.YEAR) != b.get(java.util.Calendar.YEAR) || a.get(java.util.Calendar.DAY_OF_YEAR) != b.get(java.util.Calendar.DAY_OF_YEAR)) inside = null
+  }
 
+  /** A known company beacon was heard by the scan. */
   @Synchronized
   fun seen(minor: Int, rssi: Int?, now: Long = System.currentTimeMillis()) {
-    val c = config ?: return
     val b = beacon(minor) ?: return
-    val cur = inside
-    if (cur != null && sameLocation(cur, b)) {
-      cur.lastSeen = now
-      // Persist lastSeen at most every 20 s — it's only needed if the process dies.
-      if (now - lastPersist > 20_000) { lastPersist = now; save() }
+    rollDay(now)
+    val wasAway = lastHeardAt?.let { now - it >= awayMs } ?: true
+    val unlocked = lastPassAt?.let { now - it >= lockMs } ?: true
+    lastHeardAt = now
+    if (wasAway && unlocked) {
+      toggle(b, rssi, now)
       return
     }
-    val next = Inside(b.minor, b.locationId, b.location, b.spot, now, now)
-    inside = next
-    enqueue("enter", b.minor, now, rssi, c)
-    save()
-    announce("in", next, now, null)
-    upload()
+    inside?.lastSeen = now
+    // lastHeardAt only matters if the process dies; persist it at most every 20 s.
+    if (now - lastPersist > 20_000) { lastPersist = now; save() }
   }
   private var lastPersist = 0L
 
-  /** Called by the service every few seconds: check out once the grace period has passed in silence. */
+  /** A pass: check in when out, check out when in. */
+  @Synchronized
+  private fun toggle(b: Beacon, rssi: Int?, now: Long) {
+    val c = config ?: return
+    lastPassAt = now
+    lastPersist = now
+    val cur = inside
+    if (cur != null) {
+      inside = null
+      enqueue("exit", b.minor, now, rssi, c)
+      save()
+      announce("out", Inside(b.minor, b.locationId, b.location.ifEmpty { cur.location }, b.spot, cur.since, now), now, cur.since)
+    } else {
+      val next = Inside(b.minor, b.locationId, b.location, b.spot, now, now)
+      inside = next
+      enqueue("enter", b.minor, now, rssi, c)
+      save()
+      announce("in", next, now, null)
+    }
+    upload()
+  }
+
+  /** Called by the service every few seconds: only the midnight roll-over is time driven now. */
   @Synchronized
   fun tick(now: Long = System.currentTimeMillis()) {
-    val c = config ?: return
-    val cur = inside ?: return
-    if (now - cur.lastSeen < graceMs) return
-    enqueue("exit", cur.minor, cur.lastSeen, null, c)
-    inside = null
-    save()
-    announce("out", cur, cur.lastSeen, cur.since)
-    upload()
+    val had = inside
+    rollDay(now)
+    if (had != null && inside == null) save()
   }
 
   @Synchronized
   fun simulate(type: String, minor: Int) {
-    if (type == "enter") { seen(minor, -60); return }
-    val cur = inside ?: return
-    // Simulated leave: backdate the last sighting so the grace check fires now.
-    cur.lastSeen = System.currentTimeMillis() - graceMs
-    tick()
+    val now = System.currentTimeMillis()
+    if (type == "pass") {
+      val b = beacon(minor) ?: return
+      rollDay(now)
+      lastHeardAt = now
+      toggle(b, -60, now)
+    } else {
+      // Out of range from now on: backdate the last sighting so the next one counts as a new arrival.
+      lastHeardAt = now - awayMs
+      save()
+    }
   }
 
   private fun enqueue(type: String, minor: Int, at: Long, rssi: Int?, c: JSONObject) {

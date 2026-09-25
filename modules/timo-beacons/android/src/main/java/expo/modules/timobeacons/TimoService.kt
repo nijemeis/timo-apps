@@ -30,8 +30,8 @@ import java.util.UUID
  * service (with its "Timo is active" notification) is what keeps detection working with the phone locked.
  *
  * The scan filter matches the iBeacon prefix + Timo UUID + the company major in the BLE controller —
- * required for results while the screen is off, and cheap. Every match goes to [TimoCore.seen]; a tick
- * every 10 s lets the engine apply the check-out grace period.
+ * required for results while the screen is off. Every match goes to [TimoCore.seen], which decides whether
+ * it is a pass; a tick every 10 s handles the midnight roll-over and restarts a scan the OS dropped.
  */
 class TimoService : Service() {
   private val handler = Handler(Looper.getMainLooper())
@@ -74,9 +74,7 @@ class TimoService : Service() {
   private val tick = object : Runnable {
     override fun run() {
       TimoCore.tick()
-      // Foreground: a faster scan for snappy check-ins; background: low power (grace covers the gaps).
-      val wanted = if (TimoCore.foreground) ScanSettings.SCAN_MODE_LOW_LATENCY else ScanSettings.SCAN_MODE_LOW_POWER
-      if (wanted != scanMode) restartScan()
+      if (!scanning) restartScan()
       emitNearby()
       handler.postDelayed(this, 10_000)
     }
@@ -99,7 +97,8 @@ class TimoService : Service() {
       .putShort(major.toShort()).putShort(0).put(0).array()
     val mask = ByteArray(23) { i -> if (i < 20) 0xFF.toByte() else 0 }
     val filter = ScanFilter.Builder().setManufacturerData(APPLE, data, mask).build()
-    scanMode = if (TimoCore.foreground) ScanSettings.SCAN_MODE_LOW_LATENCY else ScanSettings.SCAN_MODE_LOW_POWER
+    // Pass-the-gate needs to catch a few seconds of walking past, so the scan runs flat out even in the background.
+    scanMode = ScanSettings.SCAN_MODE_LOW_LATENCY
     val settings = ScanSettings.Builder().setScanMode(scanMode).setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES).build()
     try {
       scanner.startScan(listOf(filter), settings, callback)

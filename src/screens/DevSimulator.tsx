@@ -54,8 +54,8 @@ export function DevSimulator() {
                     </View>
                     <Text numberOfLines={1} style={{ fontFamily: fonts.regular, fontSize: 12, color: colors.muted }}>{b.spot} · <Text style={{ fontFamily: fonts.mono }}>minor {b.minor}</Text></Text>
                   </View>
-                  <Button compact height={32} fontSize={13} icon={LogIn} label={t.walkIn} onPress={run(`in${b.minor}`, () => simulate('enter', b.minor))} loading={busy === `in${b.minor}`} />
-                  <Button compact variant="secondary" height={32} fontSize={13} icon={LogOut} label={t.leave} onPress={run(`out${b.minor}`, () => simulate('exit', b.minor))} loading={busy === `out${b.minor}`} />
+                  <Button compact height={32} fontSize={13} icon={LogIn} label={t.walkIn} onPress={run(`in${b.minor}`, () => simulate('pass', b.minor))} loading={busy === `in${b.minor}`} />
+                  <Button compact variant="secondary" height={32} fontSize={13} icon={LogOut} label={t.leave} onPress={run(`out${b.minor}`, () => simulate('away', b.minor))} loading={busy === `out${b.minor}`} />
                 </View>
               );
             })}
@@ -64,8 +64,9 @@ export function DevSimulator() {
             <Button compact variant="secondary" height={30} fontSize={12} icon={RefreshCw} label={t.simSync} onPress={run('sync', flushPresence)} loading={busy === 'sync'} />
             <View style={{ flex: 1, gap: 2 }}>
               <Text style={mono}>
-                {native?.inside ? `inside ${native.inside.minor} since ${formatTime(native.inside.since)}` : 'outside'}
-                {native?.pendingExit ? ` · exit pending ${native.pendingExit.minor}` : ''}
+                {native?.inside ? `checked in ${native.inside.minor} since ${formatTime(native.inside.since)}` : 'checked out'}
+                {native?.lastPassAt ? ` · last pass ${formatTime(native.lastPassAt)}` : ''}
+                {native?.awaySince ? ` · away since ${formatTime(native.awaySince)}` : ' · in range'}
               </Text>
               <Text style={mono}>{`configured ${native?.configured ? 'yes' : 'no'} · monitoring ${native?.monitoring ? 'yes' : 'no'} · queued ${native?.queued ?? 0}`}</Text>
               <Text style={mono}>{`last sync ${native?.lastSyncAt ? formatTime(native.lastSyncAt) : '—'}${native?.lastSyncError ? ` · error ${native.lastSyncError}` : ''}`}</Text>

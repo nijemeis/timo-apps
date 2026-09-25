@@ -26,8 +26,11 @@ declare class TimoBeaconsModule extends NativeModule<TimoBeaconsEvents> {
   /** Foreground ranging for the "Nearby beacons" row. */
   startRanging(): Promise<void>;
   stopRanging(): Promise<void>;
-  /** Drive the engine as if a beacon was seen/lost — the simulator has no BLE (dev builds only in the UI). */
-  simulate(type: 'enter' | 'exit', minor: number): Promise<void>;
+  /**
+   * Drive the engine without BLE (dev builds only in the UI): 'pass' = a pass of that beacon that toggles
+   * regardless of the away/lock rules; 'away' = the beacon is out of sight from now on.
+   */
+  simulate(type: 'pass' | 'away', minor: number): Promise<void>;
 }
 
 /** Null when the native module isn't linked (e.g. Expo Go) — the presence service then runs in mock mode. */

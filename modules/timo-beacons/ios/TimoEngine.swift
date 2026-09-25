@@ -4,20 +4,19 @@ import UIKit
 import UserNotifications
 
 /**
- Timo's presence engine for iOS.
+ Timo's pass-the-gate engine for iOS.
 
  iBeacons reach an iOS app only through CoreLocation. Timo monitors ONE region — the Timo UUID plus the
  company's major — which survives termination: iOS relaunches the app in the background on enter/exit.
  Monitoring doesn't report the minor, so on enter (and whenever the screen lights up inside the region) the
- engine ranges for a short burst to learn which beacon — and so which location — it is.
+ engine ranges for a short burst to learn which beacon it is.
 
  Rules (mirroring the backend's engine.ts):
-  - first known beacon while out → check in (enter event, notification)
-  - a beacon at another location while in → check in there (the server closes the previous one)
-  - a beacon at the same location → just "still seen"; zone beacons never split a registration
-  - region exit → exit event at the last-seen time, check-out notification scheduled after the grace
-    period; if a beacon at the same location returns within the grace period the notification is
-    cancelled and an enter is queued, which the server merges back into the same registration.
+  - every pass of a company beacon toggles: checked out → check in, checked in → check out, timestamped
+    at the pass; being out of range in between means nothing (a field worker stays checked in)
+  - a sighting is a pass only if no company beacon was heard for `awaySeconds` before it, and at least
+    `lockSeconds` have passed since the previous pass — so standing at the gate never flips the state back
+  - a check-in from an earlier day is dropped at midnight (the server closes it at 23:59 as `auto`)
 
  Everything — config, state, queue — is persisted, so a background relaunch works without JavaScript.
  Events are uploaded natively to POST /api/events (idempotent on deviceId + seq).
@@ -32,17 +31,24 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
     var inTitle: String; var inBody: String; var outTitle: String; var outBody: String
     var hoursUnit: String; var minutesUnit: String
   }
+  struct ServerOpen: Codable { var minor: Int?; var since: Double }
   struct Config: Codable {
-    var uuid: String; var major: Int; var beacons: [Beacon]; var graceSeconds: Double
+    var uuid: String; var major: Int; var beacons: [Beacon]; var awaySeconds: Double; var lockSeconds: Double
+    var serverOpen: ServerOpen?
     var apiUrl: String; var token: String; var deviceId: String
     var sounds: Bool; var notifications: Bool; var strings: Strings
   }
   struct Inside: Codable { var minor: Int; var locationId: String?; var location: String; var spot: String; var since: Date; var lastSeen: Date }
-  struct PendingExit: Codable { var inside: Inside; var at: Date; var deadline: Date }
   struct State: Codable {
     var monitoring = false
     var inside: Inside?
-    var pendingExit: PendingExit?
+    /// The last sighting that toggled the state.
+    var lastPassAt: Date?
+    /// The last time any company beacon was heard, and since when none has been (region exit).
+    var lastHeardAt: Date?
+    var awaySince: Date?
+    /// Which beacon was heard last — the best guess when a region entry can't be ranged.
+    var lastHeardMinor: Int?
     var nextSeq = 0
     var lastSyncAt: Date?
     var lastSyncError: String?
@@ -67,7 +73,8 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
   private var foregroundRanging = false
   private var rangingActive = false
   private var bgTask: UIBackgroundTaskIdentifier = .invalid
-  private var exitTimer: Timer?
+  /// A region entry not yet resolved by ranging (a quick walk-by can be over before ranging starts).
+  private var pendingEntry: Date?
   private var uploading = false
   private var permissionWaiters: [(String) -> Void] = []
   private var bluetoothWaiters: [() -> Void] = []
@@ -75,7 +82,6 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
   /// Set by the Expo module: (eventName, payload).
   var emit: ((String, [String: Any]) -> Void)?
 
-  private static let checkoutNotificationId = "timo.checkout"
   private static let seqEpoch = Date(timeIntervalSince1970: 1_704_067_200) // 2024-01-01
 
   override private init() {
@@ -90,8 +96,6 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
     lm.delegate = self
     lm.pausesLocationUpdatesAutomatically = false
     NotificationCenter.default.addObserver(self, selector: #selector(appActive), name: UIApplication.didBecomeActiveNotification, object: nil)
-    // A relaunch may land after a check-out deadline passed while suspended.
-    settlePendingExit(now: Date())
     if state.monitoring, config != nil { startMonitoring() }
     if !queue.isEmpty { upload() }
   }
@@ -118,8 +122,19 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
   func configure(_ c: Config) {
     let majorChanged = config?.major != c.major || config?.uuid.uppercased() != c.uuid.uppercased()
     config = c
-    // A beacon that was un-placed while we were inside it: forget the stale state.
-    if let inside = state.inside, !c.beacons.contains(where: { $0.minor == inside.minor }) { state.inside = nil }
+    // Nothing of ours waiting for the server: take its view (fresh install, another phone, an admin fix).
+    if queue.isEmpty {
+      if let o = c.serverOpen {
+        let since = Date(timeIntervalSince1970: o.since / 1000)
+        if state.inside.map({ abs($0.since.timeIntervalSince(since)) > 1 }) ?? true {
+          let b = o.minor.flatMap { m in c.beacons.first { $0.minor == m } }
+          state.inside = Inside(minor: o.minor ?? -1, locationId: b?.locationId, location: b?.location ?? "", spot: b?.spot ?? "", since: since, lastSeen: since)
+        }
+      } else {
+        state.inside = nil
+      }
+    }
+    rollDay(Date())
     save()
     if majorChanged && state.monitoring { startMonitoring() }
   }
@@ -148,7 +163,6 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
 
   func reset() {
     stop()
-    UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.checkoutNotificationId])
     let seq = state.nextSeq
     config = nil
     state = State()
@@ -164,11 +178,19 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
 
   func simulate(type: String, minor: Int) {
     guard let c = config, let b = c.beacons.first(where: { $0.minor == minor }) else { return }
-    if type == "enter" { seen(b, rssi: -60, at: Date()) } else { regionExited(now: Date(), simulated: true) }
+    let now = Date()
+    if type == "pass" {
+      rollDay(now)
+      state.lastHeardAt = now
+      state.awaySince = nil
+      toggle(b, rssi: -60, now: now)
+    } else {
+      state.awaySince = now
+      save()
+    }
   }
 
   func flush(_ done: @escaping () -> Void) {
-    settlePendingExit(now: Date())
     upload(done)
   }
 
@@ -184,7 +206,8 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
       "configured": config != nil,
       "monitoring": state.monitoring,
       "inside": state.inside.map(insideDict) as Any,
-      "pendingExit": state.pendingExit.map { ["minor": $0.inside.minor, "at": ms($0.at), "deadline": ms($0.deadline)] } as Any,
+      "lastPassAt": state.lastPassAt.map(ms) as Any,
+      "awaySince": state.awaySince.map(ms) as Any,
       "queued": queue.count,
       "lastSyncAt": state.lastSyncAt.map(ms) as Any,
       "lastSyncError": state.lastSyncError as Any,
@@ -234,6 +257,12 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
       guard let self else { return }
       self.burstUntil = nil
       self.stopRanging(force: false)
+      // Entered the region but never ranged a known beacon: the entry itself is the pass.
+      if let at = self.pendingEntry, let c = self.config {
+        self.pendingEntry = nil
+        let b = self.state.lastHeardMinor.flatMap { m in c.beacons.first { $0.minor == m } } ?? c.beacons.first
+        if let b { self.heard(b, rssi: nil, at: at) }
+      }
       self.upload { self.endBackgroundTask() }
     }
   }
@@ -253,95 +282,53 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
 
   private func beacon(minor: Int) -> Beacon? { config?.beacons.first { $0.minor == minor } }
 
-  private func sameLocation(_ a: Inside, _ b: Beacon) -> Bool {
-    a.minor == b.minor || (a.locationId != nil && a.locationId == b.locationId)
+  /// A check-in from an earlier local day is over: the server closed it at 23:59 (`auto`).
+  private func rollDay(_ now: Date) {
+    if let i = state.inside, !Calendar.current.isDate(i.since, inSameDayAs: now) { state.inside = nil }
   }
 
-  private func seen(_ b: Beacon, rssi: Int?, at now: Date) {
+  /// A known company beacon was ranged.
+  private func heard(_ b: Beacon, rssi: Int?, at now: Date) {
     guard let c = config else { return }
-    settlePendingExit(now: now)
-
-    if let p = state.pendingExit {
-      // Back within the grace period: it was never a real check-out.
-      if sameLocation(p.inside, b) {
-        var resumed = p.inside
-        resumed.lastSeen = now
-        state.inside = resumed
-        state.pendingExit = nil
-        cancelCheckoutNotification()
-        enqueue(type: "enter", minor: b.minor, at: now, rssi: rssi, c: c)
-        save(); upload()
-        return
-      }
-      // Another location inside the grace period: the check-out stands, notify it now.
-      state.pendingExit = nil
-      fireCheckout(p, now: now)
-    }
-
-    if var inside = state.inside {
-      if sameLocation(inside, b) {
-        inside.lastSeen = now
-        state.inside = inside
-        save()
-        return
-      }
-    }
-    // Check in (or move to another location).
-    let inside = Inside(minor: b.minor, locationId: b.locationId, location: b.location, spot: b.spot, since: now, lastSeen: now)
-    state.inside = inside
-    enqueue(type: "enter", minor: b.minor, at: now, rssi: rssi, c: c)
-    save()
-    announce(type: "in", inside: inside, at: now, since: nil)
-    upload()
-  }
-
-  private func regionExited(now: Date, simulated: Bool = false) {
-    guard let c = config, let inside = state.inside else { return }
-    // CoreLocation reports an exit ~30 s after the last advertisement; ranging may know better.
-    let lastSeen = simulated ? now : max(inside.lastSeen, now.addingTimeInterval(-30))
-    enqueue(type: "exit", minor: inside.minor, at: lastSeen, rssi: nil, c: c)
-    state.inside = nil
-    let p = PendingExit(inside: inside, at: lastSeen, deadline: lastSeen.addingTimeInterval(c.graceSeconds))
-    state.pendingExit = p
-    save()
-    scheduleCheckout(p, now: now)
-    upload()
-  }
-
-  /// If the grace period of a pending exit is over, it is final.
-  private func settlePendingExit(now: Date) {
-    guard let p = state.pendingExit, p.deadline <= now else { return }
-    state.pendingExit = nil
-    save()
-    // Background: the scheduled notification has fired (or will now). Foreground: show the sheet.
-    if UIApplication.shared.applicationState == .active { fireCheckout(p, now: now) }
-  }
-
-  private func scheduleCheckout(_ p: PendingExit, now: Date) {
-    exitTimer?.invalidate()
-    let delay = max(0.5, p.deadline.timeIntervalSince(now))
-    postNotification(type: "out", inside: p.inside, at: p.at, since: p.inside.since, after: delay, id: Self.checkoutNotificationId)
-    // While the app runs, a timer settles it at the deadline (and swaps the notification for the sheet).
-    exitTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-      self?.settlePendingExit(now: Date())
-    }
-  }
-
-  private func cancelCheckoutNotification() {
-    exitTimer?.invalidate()
-    UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.checkoutNotificationId])
-  }
-
-  private func fireCheckout(_ p: PendingExit, now: Date) {
-    exitTimer?.invalidate()
-    if UIApplication.shared.applicationState == .active {
-      UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.checkoutNotificationId])
-      emit?("onPresence", presencePayload(type: "out", inside: p.inside, at: p.at, since: p.inside.since, foreground: true))
+    rollDay(now)
+    let wasAway = state.lastHeardAt == nil || (state.awaySince.map { now.timeIntervalSince($0) >= c.awaySeconds } ?? false)
+    let unlocked = state.lastPassAt.map { now.timeIntervalSince($0) >= c.lockSeconds } ?? true
+    state.lastHeardAt = now
+    state.awaySince = nil
+    state.lastHeardMinor = b.minor
+    pendingEntry = nil
+    if wasAway && unlocked {
+      toggle(b, rssi: rssi, now: now)
     } else {
-      // Deliver now in case the scheduled one was cancelled (switching location).
-      postNotification(type: "out", inside: p.inside, at: p.at, since: p.inside.since, after: nil, id: Self.checkoutNotificationId)
-      emit?("onPresence", presencePayload(type: "out", inside: p.inside, at: p.at, since: p.inside.since, foreground: false))
+      if var i = state.inside { i.lastSeen = now; state.inside = i }
+      save()
     }
+  }
+
+  /// A pass: check in when out, check out when in.
+  private func toggle(_ b: Beacon, rssi: Int?, now: Date) {
+    guard let c = config else { return }
+    state.lastPassAt = now
+    if let i = state.inside {
+      state.inside = nil
+      enqueue(type: "exit", minor: b.minor, at: now, rssi: rssi, c: c)
+      save()
+      let at = Inside(minor: b.minor, locationId: b.locationId, location: b.location.isEmpty ? i.location : b.location, spot: b.spot, since: i.since, lastSeen: now)
+      announce(type: "out", inside: at, at: now, since: i.since)
+    } else {
+      let i = Inside(minor: b.minor, locationId: b.locationId, location: b.location, spot: b.spot, since: now, lastSeen: now)
+      state.inside = i
+      enqueue(type: "enter", minor: b.minor, at: now, rssi: rssi, c: c)
+      save()
+      announce(type: "in", inside: i, at: now, since: nil)
+    }
+    upload()
+  }
+
+  /// No company beacon in range any more (CoreLocation reports this ~30 s after the last advertisement).
+  private func regionExited(now: Date) {
+    if state.awaySince == nil { state.awaySince = now.addingTimeInterval(-30) }
+    save()
   }
 
   private func announce(type: String, inside: Inside, at: Date, since: Date?) {
@@ -503,7 +490,6 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
   }
 
   @objc private func appActive() {
-    settlePendingExit(now: Date())
     if !permissionWaiters.isEmpty && lm.authorizationStatus != .notDetermined { resolveLocationWaiters() }
     if !queue.isEmpty { upload() }
     if state.monitoring, let c = config, let r = region(c) { lm.requestState(for: r) }
@@ -528,19 +514,19 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
     guard region is CLBeaconRegion else { return }
     switch regionState {
     case .inside: burst()
-    case .outside: if state.inside != nil { regionExited(now: Date()) }
+    case .outside: regionExited(now: Date())
     default: break
     }
   }
 
   func locationManager(_ manager: CLLocationManager, didEnterRegion region: CLRegion) {
     guard region is CLBeaconRegion else { return }
+    pendingEntry = Date()
     burst()
   }
 
   func locationManager(_ manager: CLLocationManager, didExitRegion region: CLRegion) {
     guard region is CLBeaconRegion else { return }
-    beginBackgroundTask()
     regionExited(now: Date())
   }
 
@@ -553,7 +539,7 @@ final class TimoEngine: NSObject, CLLocationManagerDelegate, CBCentralManagerDel
     // Strongest known beacon decides.
     guard let best = heard.filter({ beacon(minor: $0.minor.intValue) != nil }).max(by: { $0.rssi < $1.rssi }),
           let b = beacon(minor: best.minor.intValue) else { return }
-    seen(b, rssi: best.rssi, at: Date())
+    heard(b, rssi: best.rssi, at: Date())
   }
 
   func locationManager(_ manager: CLLocationManager, monitoringDidFailFor region: CLRegion?, withError error: Error) {
